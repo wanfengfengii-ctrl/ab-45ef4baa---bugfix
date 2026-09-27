@@ -477,6 +477,107 @@ describe('adjudicate · 可行方案与决胜规则', () => {
   });
 });
 
+describe('adjudicate · 大力矩与单位力矩混合：逐步边界判定不得放行真实越界', () => {
+  // 缺陷场景：8 条导轨——两条力臂 1e16、两条 1、两条 -1e16、两条 0；4 块质量
+  // 均为 1 的配重分别只能挂入自己那对同力臂导轨，代价均为 0；载荷上限 4，
+  // 力矩闭区间 [0, 1e16]。双精度下 1e16 + 1 === 1e16（ULP ≈ 2），旧实现又以
+  // 固定 EPS=1e-9 判边界，字典序最小的 A→B→C→D 在第二步的真实累计力矩
+  // 10000000000000001 被吞成上限本身而放行。
+  const T = 10000000000000000;
+  const mixedScenario = (): Scenario => ({
+    rails: rails(
+      ['正T-1', T],
+      ['正T-2', T],
+      ['单位1-1', 1],
+      ['单位1-2', 1],
+      ['负T-1', -T],
+      ['负T-2', -T],
+      ['零-1', 0],
+      ['零-2', 0],
+    ),
+    blocks: [
+      block('A', 1, [[0, 0], [1, 0]]),
+      block('B', 1, [[2, 0], [3, 0]]),
+      block('C', 1, [[4, 0], [5, 0]]),
+      block('D', 1, [[6, 0], [7, 0]]),
+    ],
+    limits: limits(4, 0, T),
+  });
+
+  it('缺陷根因可复现：双精度把 T+1 吞成 T', () => {
+    expect(T + 1).toBe(T);
+    expect(T + 1 > T + EPS).toBe(false); // 旧的固定容差判定会放行
+  });
+
+  it('返回仍可行且字典序最小的安全顺序 A→C→B→D（0,2,1,3），绝不接受 A→B→C→D 的第二步', () => {
+    const outcome = adjudicate(mixedScenario());
+    expect(outcome.feasible).toBe(true);
+    if (!outcome.feasible) return;
+    const order = outcome.plan.steps.map((s) => s.blockIndex);
+    // 核心回归：不安全的 0,1,2,3 不得作为方案输出
+    expect(order).not.toEqual([0, 1, 2, 3]);
+    expect(order).toEqual([0, 2, 1, 3]);
+    expect(outcome.plan.steps.map((s) => s.railName)).toEqual([
+      '正T-1',
+      '负T-1',
+      '单位1-1',
+      '零-1',
+    ]);
+  });
+
+  it('各步精确累计力矩依次为 T、0、1、1，均落在闭区间 [0,T] 内（逐步边界判定）', () => {
+    const outcome = adjudicate(mixedScenario());
+    expect(outcome.feasible).toBe(true);
+    if (!outcome.feasible) return;
+    const torques = outcome.plan.steps.map((s) => s.cumulativeTorque);
+    // T+0 与 T+(-T) 在双精度下也恰为 T 与 0；1、1 不被吞
+    expect(torques).toEqual([T, 0, 1, 1]);
+    // 每一步都必须在闭区间内（含等号：第一步力矩恰为上限 T）
+    for (const s of outcome.plan.steps) {
+      expect(s.cumulativeTorque).toBeGreaterThanOrEqual(0);
+      expect(s.cumulativeTorque).toBeLessThanOrEqual(T);
+    }
+    expect(outcome.plan.steps[0].cumulativeTorque).toBe(T); // 闭区间接纳上边界
+    expect(outcome.plan.steps[0].torqueMargin).toBe(0);
+    expect(outcome.plan.finalMass).toBe(4);
+    expect(outcome.plan.totalCostText).toBe('0');
+  });
+
+  it('结果稳定：重复裁决一致', () => {
+    const s = mixedScenario();
+    expect(adjudicate(s)).toEqual(adjudicate(s));
+  });
+
+  it('无可行方案的诊断同样按精确值分类：T+1 越上端在双精度下恰被吞成 T，仍须报 torque-high', () => {
+    // 四块：A 只能挂 +T、B 只能挂 +1、C/D 只能挂 0。A 在 B 之后挂则真实
+    // 力矩 T+1 越上端；A 在 B 之前挂则挂 B 时 T+1 越上端——整局不可行。
+    // 最深可行前缀为 B→C→D（力矩 1），其后挂 A 的真实力矩 T+1 超出上端 T：
+    // 双精度下 T+1 === T，若按浮点分类会把该选择误判为恰在边界上而漏报。
+    const outcome = adjudicate({
+      rails: rails(['正T-1', T], ['正T-2', T], ['单位1-1', 1], ['单位1-2', 1], ['零-1', 0], ['零-2', 0]),
+      blocks: [
+        block('A', 1, [[0, 0], [1, 0]]),
+        block('B', 1, [[2, 0], [3, 0]]),
+        block('C', 1, [[4, 0], [5, 0]]),
+        block('D', 1, [[4, 0], [5, 0]]),
+      ],
+      limits: limits(4, 0, T),
+    });
+    expect(outcome.feasible).toBe(false);
+    if (outcome.feasible) return;
+    expect(outcome.report.witnessPrefix.map((s) => s.blockIndex)).toEqual([1, 2, 3]);
+    // 剩余块 A 的两个 +T 位置都触发力矩越上端
+    expect(outcome.report.violations).toHaveLength(2);
+    for (const v of outcome.report.violations) {
+      expect(v.blockIndex).toBe(0);
+      expect(v.kinds).toEqual(['torque-high']);
+      // 双精度视图确实把真实的 T+1 显示成 T，佐证分类必须依赖精确值
+      expect(v.torqueAfter).toBe(T);
+      expect(T + 1).toBe(T);
+    }
+  });
+});
+
 describe('adjudicate · 无可行方案的诊断', () => {
   it('第一步即不可挂：已选前缀为空，逐一列出触发的力矩限制', () => {
     const outcome = adjudicate({

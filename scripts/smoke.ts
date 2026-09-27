@@ -301,6 +301,57 @@ if (r9.feasible) {
   check(p.finalMass === 4 && p.minTorqueMargin === 1, '大额代价：可行性与力矩余量不受影响');
 }
 
+// 大力矩与单位力矩混合场景（本次缺陷回归）：8 条导轨力臂为
+// 10000000000000000×2 / 1×2 / -10000000000000000×2 / 0×2；4 块单位质量配重
+// 各自只能挂自己那对同力臂导轨，代价均为 0；载荷上限 4，力矩闭区间
+// [0, 10000000000000000]。双精度下 T+1 === T（ULP ≈ 2），旧实现叠加固定
+// EPS=1e-9 把 A→B→C→D 第二步的真实累计力矩 T+1 当作恰在边界放行；修复后
+// 必须拒绝该步，返回仍可行且字典序最小的安全顺序 0,2,1,3（A→C→B→D），
+// 各步精确累计力矩为 T、0、1、1，均落在闭区间内。
+const T_MIXED = 10000000000000000;
+const mixedTorqueScenario: Scenario = {
+  rails: [
+    { id: 'P1', name: '正T-1', coordinate: T_MIXED },
+    { id: 'P2', name: '正T-2', coordinate: T_MIXED },
+    { id: 'U1', name: '单位1-1', coordinate: 1 },
+    { id: 'U2', name: '单位1-2', coordinate: 1 },
+    { id: 'N1', name: '负T-1', coordinate: -T_MIXED },
+    { id: 'N2', name: '负T-2', coordinate: -T_MIXED },
+    { id: 'Z1', name: '零-1', coordinate: 0 },
+    { id: 'Z2', name: '零-2', coordinate: 0 },
+  ],
+  blocks: [
+    { id: 'A', name: 'A', mass: 1, options: [{ railId: 'P1', cost: 0 }, { railId: 'P2', cost: 0 }] },
+    { id: 'B', name: 'B', mass: 1, options: [{ railId: 'U1', cost: 0 }, { railId: 'U2', cost: 0 }] },
+    { id: 'C', name: 'C', mass: 1, options: [{ railId: 'N1', cost: 0 }, { railId: 'N2', cost: 0 }] },
+    { id: 'D', name: 'D', mass: 1, options: [{ railId: 'Z1', cost: 0 }, { railId: 'Z2', cost: 0 }] },
+  ],
+  limits: { maxLoad: 4, minTorque: 0, maxTorque: T_MIXED },
+};
+
+const r10 = adjudicate(mixedTorqueScenario);
+check(r10.feasible, '裁决模块：大力矩/单位力矩混合场景应判定为可行');
+if (r10.feasible) {
+  const p = r10.plan;
+  check(p.steps.length === 4, '大力矩混合：完整方案应覆盖四块配重');
+  check(
+    p.steps.map((s) => s.blockIndex).join(',') === '0,2,1,3',
+    `大力矩混合：不得放行不安全的 0,1,2,3，应返回安全且字典序最小的 0,2,1,3（实际 ${p.steps
+      .map((s) => s.blockIndex)
+      .join(',')}）`,
+  );
+  check(
+    p.steps.map((s) => s.cumulativeTorque).join(',') === `${T_MIXED},0,1,1`,
+    `大力矩混合：各步累计力矩应为 T,0,1,1（实际 ${p.steps.map((s) => s.cumulativeTorque).join(',')}）`,
+  );
+  check(
+    p.steps.every((s) => s.cumulativeMass <= 4 && s.cumulativeTorque >= 0 && s.cumulativeTorque <= T_MIXED),
+    '大力矩混合：每个前缀状态均落在载荷与力矩闭区间内',
+  );
+  check(p.steps[0].cumulativeTorque === T_MIXED, '大力矩混合：第一步力矩恰为上限（闭区间接纳等号）');
+  check(p.totalCostText === '0' && p.finalMass === 4, '大力矩混合：总代价 0、最终载荷恰为上限 4');
+}
+
 // 不可行场景：深度 1 即止步，最深前缀为 b1@R（余量最大），剩余选择同时触发载荷与力矩限制。
 const infeasibleScenario: Scenario = {
   rails: [{ id: 'R', name: 'R', coordinate: 1 }],

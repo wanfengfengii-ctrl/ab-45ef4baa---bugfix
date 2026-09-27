@@ -73,11 +73,15 @@ export function parseDraft(d: Draft): ParseResult {
       id: r.id,
       name: r.name,
       coordinate: num(r.coordinate, `导轨「${r.name}」的力臂坐标`),
+      // 保留录入原文：载荷/力矩闭区间的边界判定按原文逐位精确进行，避免
+      // 大数值（如 10000000000000000）下双精度吞掉单位级的真实累计越界。
+      coordinateText: r.coordinate.trim(),
     })),
     blocks: d.blocks.map((b) => ({
       id: b.id,
       name: b.name,
       mass: num(b.mass, `配重「${b.name}」的质量`),
+      massText: b.mass.trim(),
       options: b.options.map((o) => ({
         railId: o.railId,
         cost: num(o.cost, `配重「${b.name}」的安装代价`),
@@ -90,6 +94,9 @@ export function parseDraft(d: Draft): ParseResult {
       maxLoad: num(d.maxLoad, '卷扬轴总载荷上限'),
       minTorque: num(d.minTorque, '力矩区间下端'),
       maxTorque: num(d.maxTorque, '力矩区间上端'),
+      maxLoadText: d.maxLoad.trim(),
+      minTorqueText: d.minTorque.trim(),
+      maxTorqueText: d.maxTorque.trim(),
     },
   };
   errors.push(...validateScenario(scenario));

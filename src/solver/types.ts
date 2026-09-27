@@ -3,6 +3,12 @@ export interface RailPosition {
   id: string;
   name: string;
   coordinate: number;
+  /**
+   * 力臂的录入十进制原文（可选）。边界判定（力矩闭区间）按此原文逐位
+   * 精确比较：大力臂（如 10000000000000000）下双精度会把 +1 的真实累计
+   * 力矩吞成力臂本身，缺省原文时才退回 coordinate 的最短往返表示。
+   */
+  coordinateText?: string;
 }
 
 /** 某块配重的一个可挂入选项：挂到指定导轨位置的安装代价。 */
@@ -22,6 +28,11 @@ export interface BlockInput {
   id: string;
   name: string;
   mass: number;
+  /**
+   * 质量的录入十进制原文（可选）。边界判定（总载荷）按此原文逐位精确
+   * 比较；缺省原文时退回 mass 的最短往返表示。
+   */
+  massText?: string;
   /** 可挂入的 2~3 个导轨位置，数组顺序即“位置录入序号”。 */
   options: BlockOptionInput[];
 }
@@ -31,6 +42,14 @@ export interface Limits {
   maxLoad: number;
   minTorque: number;
   maxTorque: number;
+  /**
+   * 各边界的录入十进制原文（可选）。边界判定按此原文逐位精确比较，避免
+   * 大数（如 10000000000000000）下双精度吞掉单位级真实越界；缺省时退回
+   * 对应 number 的最短往返表示。
+   */
+  maxLoadText?: string;
+  minTorqueText?: string;
+  maxTorqueText?: string;
 }
 
 export interface Scenario {

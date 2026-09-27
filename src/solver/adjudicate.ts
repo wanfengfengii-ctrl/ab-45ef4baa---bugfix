@@ -6,6 +6,14 @@ import {
   decimalToString,
   type Decimal,
 } from './decimal';
+import {
+  rationalAdd,
+  rationalCompare,
+  rationalFromInput,
+  rationalMul,
+  rationalToNumber,
+  type Rational,
+} from './exact';
 import type {
   AdjudicationOutcome,
   Limits,
@@ -17,29 +25,39 @@ import type {
 } from './types';
 
 /**
- * 数值比较容差：质量/力臂为浮点录入，仅用于载荷与力矩的**边界判定**
- * （闭区间的浮点容差接纳）及不可行诊断中的限制分类。
- * 注意：力矩余量决胜与安装代价比较都不使用此容差——余量按双精度严格
- * 比较，任何真实存在的余量差（哪怕 5e-10）都优先于成本决胜；代价是
- * 逐位有意义的录入值，按十进制精确比较（见 ./decimal），任何真实的
- * 十进制差额（哪怕 1e-10）都必须体现。
+ * 数值比较容差（仅保留给双精度视图的外部断言/展示场景）。
+ *
+ * 注意：求解器内部的载荷与力矩**边界判定**不再使用此固定绝对容差，而是按
+ * 录入十进制文本恢复的精确有理数逐位比较（见 ./exact）：在 1e16 量级，一个
+ * 双精度 ULP 约为 2，固定 1e-9 会把整单位的真实越界（如累计力矩
+ * 10000000000000001 超出上限 10000000000000000）吞掉。力矩余量决胜与安装
+ * 代价比较也不使用此容差——余量按双精度严格比较，任何真实存在的余量差
+ * （哪怕 5e-10 级）都优先于成本；代价按十进制精确比较（见 ./decimal）。
  */
 export const EPS = 1e-9;
+
+const RATIONAL_ZERO: Rational = { numerator: 0n, denominator: 1n };
 
 interface FlatOption {
   optionIndex: number;
   railId: string;
   railName: string;
   coordinate: number;
+  /** 力臂的精确十进制值（由录入原文恢复，缺省时取 number 的最短往返表示）。 */
+  coordinateExact: Rational;
   cost: number;
   /** 本选项代价的精确十进制值（优先由录入原文恢复，见 decimalFromCostInput）。 */
   costDecimal: Decimal;
+  /** 本步力矩增量 = 质量 × 力臂 的精确值（质量/力臂均为录入十进制值）。 */
+  torqueTermExact: Rational;
 }
 
 interface FlatBlock {
   index: number;
   name: string;
   mass: number;
+  /** 质量的精确十进制值。 */
+  massExact: Rational;
   options: FlatOption[];
 }
 
@@ -95,31 +113,47 @@ function isBetter(a: Candidate, b: Candidate | null): boolean {
  * 因此绝不出现“先定最终位置再事后排序”的情况；力矩余量沿前缀单调不增、
  * 总代价单调不减（代价非负），据此对当前最优解做分支限界。
  *
- * 总代价以精确十进制累计：十进制加法可交换且与求和次序无关，同一组位置
- * 选择无论以何种次序挂装都得到逐位相同的总代价，真正同成本的方案才能
- * 稳定地落到序号决胜。
+ * 边界判定按录入十进制值的精确有理数进行（质量、力臂、区间端点均逐位
+ * 恢复）：大力臂（如 1e16）与单位力矩混合时，双精度会把 T+1 吞成 T
+ * （1e16 处 ULP ≈ 2），固定绝对容差更会放行真实越界；精确累加下
+ * 10000000000000001 与上限 10000000000000000 严格可分。力矩余量决胜仍用
+ * 双精度严格比较，总代价以精确十进制累计。
  */
 export function adjudicate(scenario: Scenario): AdjudicationOutcome {
   const railById = new Map(scenario.rails.map((r) => [r.id, r]));
-  const blocks: FlatBlock[] = scenario.blocks.map((b, i) => ({
-    index: i,
-    name: b.name,
-    mass: b.mass,
-    options: b.options.map((o, j) => {
-      const rail = railById.get(o.railId);
-      if (!rail) throw new Error(`未知导轨位置: ${o.railId}`);
-      return {
-        optionIndex: j,
-        railId: rail.id,
-        railName: rail.name,
-        coordinate: rail.coordinate,
-        cost: o.cost,
-        costDecimal: decimalFromCostInput(o),
-      };
-    }),
-  }));
-  const n = blocks.length;
   const limits = scenario.limits;
+  const maxLoadExact = rationalFromInput({ value: limits.maxLoad, text: limits.maxLoadText });
+  const minTorqueExact = rationalFromInput({ value: limits.minTorque, text: limits.minTorqueText });
+  const maxTorqueExact = rationalFromInput({ value: limits.maxTorque, text: limits.maxTorqueText });
+
+  const blocks: FlatBlock[] = scenario.blocks.map((b, i) => {
+    const massExact = rationalFromInput({ value: b.mass, text: b.massText });
+    return {
+      index: i,
+      name: b.name,
+      mass: b.mass,
+      massExact,
+      options: b.options.map((o, j) => {
+        const rail = railById.get(o.railId);
+        if (!rail) throw new Error(`未知导轨位置: ${o.railId}`);
+        const coordinateExact = rationalFromInput({
+          value: rail.coordinate,
+          text: rail.coordinateText,
+        });
+        return {
+          optionIndex: j,
+          railId: rail.id,
+          railName: rail.name,
+          coordinate: rail.coordinate,
+          coordinateExact,
+          cost: o.cost,
+          costDecimal: decimalFromCostInput(o),
+          torqueTermExact: rationalMul(massExact, coordinateExact),
+        };
+      }),
+    };
+  });
+  const n = blocks.length;
 
   const used = new Array<boolean>(n).fill(false);
   const steps: StepRecord[] = [];
@@ -144,7 +178,15 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
     cost,
   });
 
-  const dfs = (depth: number, mass: number, torque: number, cost: Decimal, minMargin: number): void => {
+  const dfs = (
+    depth: number,
+    mass: number,
+    torque: number,
+    massExact: Rational,
+    torqueExact: Rational,
+    cost: Decimal,
+    minMargin: number,
+  ): void => {
     const current = snapshot(cost, minMargin);
     if (isBetter(current, bestPartial[depth])) bestPartial[depth] = current;
     if (depth === n) {
@@ -155,10 +197,17 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
       if (used[i]) continue;
       const block = blocks[i];
       for (const opt of block.options) {
+        // 精确边界判定：质量/力矩均按录入十进制值逐位累加后与闭区间比较，
+        // 闭区间接纳等号，任何真实越界（哪怕 1）都不靠浮点容差放行。
+        const massAfterExact = rationalAdd(massExact, block.massExact);
+        if (rationalCompare(massAfterExact, maxLoadExact) > 0) continue;
+        const torqueAfterExact = rationalAdd(torqueExact, opt.torqueTermExact);
+        if (rationalCompare(torqueAfterExact, minTorqueExact) < 0) continue;
+        if (rationalCompare(torqueAfterExact, maxTorqueExact) > 0) continue;
+
+        // 双精度视图：仅用于力矩余量决胜与逐步展示（不参与边界判定）。
         const massAfter = mass + block.mass;
-        if (massAfter > limits.maxLoad + EPS) continue;
         const torqueAfter = torque + block.mass * opt.coordinate;
-        if (torqueAfter < limits.minTorque - EPS || torqueAfter > limits.maxTorque + EPS) continue;
         const margin = torqueMarginOf(torqueAfter, limits);
         const nextMinMargin = Math.min(minMargin, margin);
         // 精确十进制累加本步代价（代价非负，规模 ≤7，开销可忽略）。
@@ -189,14 +238,22 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
           loadMargin: limits.maxLoad - massAfter,
           torqueMargin: margin,
         });
-        dfs(depth + 1, massAfter, torqueAfter, nextCost, nextMinMargin);
+        dfs(
+          depth + 1,
+          massAfter,
+          torqueAfter,
+          massAfterExact,
+          torqueAfterExact,
+          nextCost,
+          nextMinMargin,
+        );
         steps.pop();
         used[i] = false;
       }
     }
   };
 
-  dfs(0, 0, 0, DECIMAL_ZERO, Number.POSITIVE_INFINITY);
+  dfs(0, 0, 0, RATIONAL_ZERO, RATIONAL_ZERO, DECIMAL_ZERO, Number.POSITIVE_INFINITY);
 
   const winner = getBest();
   if (winner) return { feasible: true, plan: winner.plan };
@@ -207,19 +264,29 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
   const witness = depth >= 0 ? bestPartial[depth] : null;
   const witnessSteps = witness ? witness.plan.steps : [];
   const usedBlocks = new Set(witnessSteps.map((s) => s.blockIndex));
-  const baseMass = witness ? witness.plan.finalMass : 0;
-  const baseTorque = witness ? witness.plan.finalTorque : 0;
+
+  // 由已选前缀重建精确载荷/力矩状态（步记录只保留双精度视图）。
+  let baseMassExact: Rational = RATIONAL_ZERO;
+  let baseTorqueExact: Rational = RATIONAL_ZERO;
+  for (const s of witnessSteps) {
+    const block = blocks[s.blockIndex];
+    const opt = block.options[s.optionIndex];
+    baseMassExact = rationalAdd(baseMassExact, block.massExact);
+    baseTorqueExact = rationalAdd(baseTorqueExact, opt.torqueTermExact);
+  }
+  const baseMass = rationalToNumber(baseMassExact);
+  const baseTorque = rationalToNumber(baseTorqueExact);
 
   const violations: Violation[] = [];
   for (const block of blocks) {
     if (usedBlocks.has(block.index)) continue;
     for (const opt of block.options) {
-      const massAfter = baseMass + block.mass;
-      const torqueAfter = baseTorque + block.mass * opt.coordinate;
+      const massAfterExact = rationalAdd(baseMassExact, block.massExact);
+      const torqueAfterExact = rationalAdd(baseTorqueExact, opt.torqueTermExact);
       const kinds: ViolationKind[] = [];
-      if (massAfter > limits.maxLoad + EPS) kinds.push('load');
-      if (torqueAfter < limits.minTorque - EPS) kinds.push('torque-low');
-      if (torqueAfter > limits.maxTorque + EPS) kinds.push('torque-high');
+      if (rationalCompare(massAfterExact, maxLoadExact) > 0) kinds.push('load');
+      if (rationalCompare(torqueAfterExact, minTorqueExact) < 0) kinds.push('torque-low');
+      if (rationalCompare(torqueAfterExact, maxTorqueExact) > 0) kinds.push('torque-high');
       if (kinds.length > 0) {
         violations.push({
           blockIndex: block.index,
@@ -227,8 +294,8 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
           optionIndex: opt.optionIndex,
           railId: opt.railId,
           railName: opt.railName,
-          massAfter,
-          torqueAfter,
+          massAfter: baseMass + block.mass,
+          torqueAfter: baseTorque + block.mass * opt.coordinate,
           kinds,
         });
       }
