@@ -3,6 +3,9 @@ import {
   decimalAdd,
   decimalCompare,
   decimalFromCostInput,
+  decimalFromNumber,
+  decimalMultiply,
+  decimalToNumber,
   decimalToString,
   type Decimal,
 } from './decimal';
@@ -17,8 +20,11 @@ import type {
 } from './types';
 
 /**
- * 数值比较容差：质量/力臂为浮点录入，仅用于载荷与力矩的**边界判定**
- * （闭区间的浮点容差接纳）及不可行诊断中的限制分类。
+ * 数值比较容差：仅用于载荷与力矩的**边界判定**（闭区间的容差接纳）及
+ * 不可行诊断中的限制分类。判定本身在精确十进制上进行（质量、力臂、区间
+ * 端点按最短往返十进制恢复，累计不经过双精度舍入），EPS 是以精确十进制
+ * 加在区间端点上的绝对容差——不会像浮点容差那样在大量级下被 ULP 吞掉
+ * （1e16 附近双精度 ULP 为 2，1e16 + 1 会舍入回 1e16）。
  * 注意：力矩余量决胜与安装代价比较都不使用此容差——余量按双精度严格
  * 比较，任何真实存在的余量差（哪怕 5e-10）都优先于成本决胜；代价是
  * 逐位有意义的录入值，按十进制精确比较（见 ./decimal），任何真实的
@@ -34,12 +40,16 @@ interface FlatOption {
   cost: number;
   /** 本选项代价的精确十进制值（优先由录入原文恢复，见 decimalFromCostInput）。 */
   costDecimal: Decimal;
+  /** 本选项的力矩增量（质量 × 力臂）的精确十进制值，用于累计力矩的精确边界判定。 */
+  torqueDecimal: Decimal;
 }
 
 interface FlatBlock {
   index: number;
   name: string;
   mass: number;
+  /** 质量的精确十进制值（最短往返表示），用于累计载荷的精确边界判定。 */
+  massDecimal: Decimal;
   options: FlatOption[];
 }
 
@@ -95,31 +105,49 @@ function isBetter(a: Candidate, b: Candidate | null): boolean {
  * 因此绝不出现“先定最终位置再事后排序”的情况；力矩余量沿前缀单调不增、
  * 总代价单调不减（代价非负），据此对当前最优解做分支限界。
  *
+ * 累计载荷与累计力矩以精确十进制推进：质量、力臂按最短往返十进制恢复，
+ * 逐步累加不经过双精度舍入——大力臂与单位力矩混合时（如 1e16 与 1），
+ * 双精度会把 1e16 + 1 舍入回 1e16，精确累计力矩 10000000000000001 的
+ * 越界就此被掩盖；十进制累计下该越界必被边界判定拒绝。边界判定仍以
+ * EPS 为绝对容差（以精确十进制加在端点上，不随量级失效）。
+ *
  * 总代价以精确十进制累计：十进制加法可交换且与求和次序无关，同一组位置
  * 选择无论以何种次序挂装都得到逐位相同的总代价，真正同成本的方案才能
  * 稳定地落到序号决胜。
  */
 export function adjudicate(scenario: Scenario): AdjudicationOutcome {
   const railById = new Map(scenario.rails.map((r) => [r.id, r]));
-  const blocks: FlatBlock[] = scenario.blocks.map((b, i) => ({
-    index: i,
-    name: b.name,
-    mass: b.mass,
-    options: b.options.map((o, j) => {
-      const rail = railById.get(o.railId);
-      if (!rail) throw new Error(`未知导轨位置: ${o.railId}`);
-      return {
-        optionIndex: j,
-        railId: rail.id,
-        railName: rail.name,
-        coordinate: rail.coordinate,
-        cost: o.cost,
-        costDecimal: decimalFromCostInput(o),
-      };
-    }),
-  }));
+  const blocks: FlatBlock[] = scenario.blocks.map((b, i) => {
+    const massDecimal = decimalFromNumber(b.mass);
+    return {
+      index: i,
+      name: b.name,
+      mass: b.mass,
+      massDecimal,
+      options: b.options.map((o, j) => {
+        const rail = railById.get(o.railId);
+        if (!rail) throw new Error(`未知导轨位置: ${o.railId}`);
+        return {
+          optionIndex: j,
+          railId: rail.id,
+          railName: rail.name,
+          coordinate: rail.coordinate,
+          cost: o.cost,
+          costDecimal: decimalFromCostInput(o),
+          torqueDecimal: decimalMultiply(massDecimal, decimalFromNumber(rail.coordinate)),
+        };
+      }),
+    };
+  });
   const n = blocks.length;
   const limits = scenario.limits;
+
+  // 载荷/力矩边界（含 EPS 绝对容差）的精确十进制形式：判定全程不经过双精度，
+  // 大量级下容差不会被 ULP 吞掉，小增量也不会被舍入掩盖。
+  const epsDecimal = decimalFromNumber(EPS);
+  const maxLoadBound = decimalAdd(decimalFromNumber(limits.maxLoad), epsDecimal);
+  const minTorqueBound = decimalAdd(decimalFromNumber(limits.minTorque), decimalFromNumber(-EPS));
+  const maxTorqueBound = decimalAdd(decimalFromNumber(limits.maxTorque), epsDecimal);
 
   const used = new Array<boolean>(n).fill(false);
   const steps: StepRecord[] = [];
@@ -144,7 +172,7 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
     cost,
   });
 
-  const dfs = (depth: number, mass: number, torque: number, cost: Decimal, minMargin: number): void => {
+  const dfs = (depth: number, mass: Decimal, torque: Decimal, cost: Decimal, minMargin: number): void => {
     const current = snapshot(cost, minMargin);
     if (isBetter(current, bestPartial[depth])) bestPartial[depth] = current;
     if (depth === n) {
@@ -155,10 +183,19 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
       if (used[i]) continue;
       const block = blocks[i];
       for (const opt of block.options) {
-        const massAfter = mass + block.mass;
-        if (massAfter > limits.maxLoad + EPS) continue;
-        const torqueAfter = torque + block.mass * opt.coordinate;
-        if (torqueAfter < limits.minTorque - EPS || torqueAfter > limits.maxTorque + EPS) continue;
+        // 精确十进制推进累计载荷与累计力矩，边界判定不受双精度舍入影响。
+        const massAfterDecimal = decimalAdd(mass, block.massDecimal);
+        if (decimalCompare(massAfterDecimal, maxLoadBound) > 0) continue;
+        const torqueAfterDecimal = decimalAdd(torque, opt.torqueDecimal);
+        if (
+          decimalCompare(torqueAfterDecimal, minTorqueBound) < 0 ||
+          decimalCompare(torqueAfterDecimal, maxTorqueBound) > 0
+        ) {
+          continue;
+        }
+        // 展示与余量决胜用的双精度视图：由精确值正确舍入到最近的双精度。
+        const massAfter = decimalToNumber(massAfterDecimal);
+        const torqueAfter = decimalToNumber(torqueAfterDecimal);
         const margin = torqueMarginOf(torqueAfter, limits);
         const nextMinMargin = Math.min(minMargin, margin);
         // 精确十进制累加本步代价（代价非负，规模 ≤7，开销可忽略）。
@@ -189,14 +226,14 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
           loadMargin: limits.maxLoad - massAfter,
           torqueMargin: margin,
         });
-        dfs(depth + 1, massAfter, torqueAfter, nextCost, nextMinMargin);
+        dfs(depth + 1, massAfterDecimal, torqueAfterDecimal, nextCost, nextMinMargin);
         steps.pop();
         used[i] = false;
       }
     }
   };
 
-  dfs(0, 0, 0, DECIMAL_ZERO, Number.POSITIVE_INFINITY);
+  dfs(0, DECIMAL_ZERO, DECIMAL_ZERO, DECIMAL_ZERO, Number.POSITIVE_INFINITY);
 
   const winner = getBest();
   if (winner) return { feasible: true, plan: winner.plan };
@@ -207,19 +244,31 @@ export function adjudicate(scenario: Scenario): AdjudicationOutcome {
   const witness = depth >= 0 ? bestPartial[depth] : null;
   const witnessSteps = witness ? witness.plan.steps : [];
   const usedBlocks = new Set(witnessSteps.map((s) => s.blockIndex));
-  const baseMass = witness ? witness.plan.finalMass : 0;
-  const baseTorque = witness ? witness.plan.finalTorque : 0;
 
   const violations: Violation[] = [];
+  // 已选前缀的累计载荷/力矩按精确十进制重算（各步质量与力臂即求解时的录入值），
+  // 限制分类与搜索中的边界判定保持同一精度基准。
+  let baseMassDecimal = DECIMAL_ZERO;
+  let baseTorqueDecimal = DECIMAL_ZERO;
+  for (const s of witnessSteps) {
+    const stepMass = decimalFromNumber(s.mass);
+    baseMassDecimal = decimalAdd(baseMassDecimal, stepMass);
+    baseTorqueDecimal = decimalAdd(
+      baseTorqueDecimal,
+      decimalMultiply(stepMass, decimalFromNumber(s.coordinate)),
+    );
+  }
   for (const block of blocks) {
     if (usedBlocks.has(block.index)) continue;
     for (const opt of block.options) {
-      const massAfter = baseMass + block.mass;
-      const torqueAfter = baseTorque + block.mass * opt.coordinate;
+      const massAfterDecimal = decimalAdd(baseMassDecimal, block.massDecimal);
+      const torqueAfterDecimal = decimalAdd(baseTorqueDecimal, opt.torqueDecimal);
+      const massAfter = decimalToNumber(massAfterDecimal);
+      const torqueAfter = decimalToNumber(torqueAfterDecimal);
       const kinds: ViolationKind[] = [];
-      if (massAfter > limits.maxLoad + EPS) kinds.push('load');
-      if (torqueAfter < limits.minTorque - EPS) kinds.push('torque-low');
-      if (torqueAfter > limits.maxTorque + EPS) kinds.push('torque-high');
+      if (decimalCompare(massAfterDecimal, maxLoadBound) > 0) kinds.push('load');
+      if (decimalCompare(torqueAfterDecimal, minTorqueBound) < 0) kinds.push('torque-low');
+      if (decimalCompare(torqueAfterDecimal, maxTorqueBound) > 0) kinds.push('torque-high');
       if (kinds.length > 0) {
         violations.push({
           blockIndex: block.index,

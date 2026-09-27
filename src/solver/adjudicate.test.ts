@@ -421,6 +421,82 @@ describe('adjudicate · 可行方案与决胜规则', () => {
     expect(outcome.plan.steps[0].railName).toBe('R');
   });
 
+  it('大力矩与单位力矩混合：精确累计越界的次序不得输出，返回字典序最小的安全次序', () => {
+    // 报告场景：8 条导轨（两条力臂 1e16、两条 1、两条 -1e16、两条 0），
+    // 4 块质量均为 1 的配重各只能挂入对应力臂的一对导轨，代价均为 0；
+    // 载荷上限 4，力矩闭区间 [0, 1e16]。
+    // 双精度在 1e16 附近 ULP 为 2：1e16 + 1 舍入回 1e16，旧实现据此把
+    // A→B→C→D 第二步的精确累计力矩 10000000000000001 误判为未越界，
+    // 输出不安全次序。修复后须拒绝该次序的第二步，返回仍可行且字典序
+    // 最小的安全次序 A→C→B→D（0,2,1,3）。
+    expect(1e16 + 1).toBe(1e16); // 佐证双精度会吞掉单位力矩增量
+    const outcome = adjudicate({
+      rails: rails(
+        ['P1', 1e16],
+        ['P2', 1e16],
+        ['p1', 1],
+        ['p2', 1],
+        ['N1', -1e16],
+        ['N2', -1e16],
+        ['Z1', 0],
+        ['Z2', 0],
+      ),
+      blocks: [
+        block('A', 1, [[0, 0], [1, 0]]),
+        block('B', 1, [[2, 0], [3, 0]]),
+        block('C', 1, [[4, 0], [5, 0]]),
+        block('D', 1, [[6, 0], [7, 0]]),
+      ],
+      limits: limits(4, 0, 1e16),
+    });
+    expect(outcome.feasible).toBe(true);
+    if (!outcome.feasible) return;
+    const plan = outcome.plan;
+    // 完整方案：四块各恰用一次；不得是 A→B→C→D（0,1,2,3）——其第二步
+    // 精确累计力矩 10000000000000001 已超出上限 1e16
+    expect(plan.steps).toHaveLength(4);
+    expect(plan.steps.map((s) => s.blockIndex)).toEqual([0, 2, 1, 3]); // A→C→B→D
+    expect(plan.steps.map((s) => s.blockName)).toEqual(['A', 'C', 'B', 'D']);
+    // 稳定决胜：余量（均为 0）与代价（均为 0）并列时按录入序号取字典序最小
+    expect(plan.steps.map((s) => s.optionIndex)).toEqual([0, 0, 0, 0]);
+    expect(plan.steps.map((s) => s.railName)).toEqual(['P1', 'N1', 'p1', 'Z1']);
+    // 各步累计力矩依次为 1e16、0、1、1，均落在允许闭区间 [0, 1e16] 内
+    expect(plan.steps.map((s) => s.cumulativeTorque)).toEqual([1e16, 0, 1, 1]);
+    for (const s of plan.steps) {
+      expect(s.cumulativeMass).toBeLessThanOrEqual(4 + EPS);
+      expect(s.cumulativeTorque).toBeGreaterThanOrEqual(0 - EPS);
+      expect(s.cumulativeTorque).toBeLessThanOrEqual(1e16 + EPS);
+    }
+    // 首步力矩恰为区间上端（闭区间边界须接纳），最终力矩为 1
+    expect(plan.steps[0].cumulativeTorque).toBe(1e16);
+    expect(plan.finalTorque).toBe(1);
+    expect(plan.finalMass).toBe(4);
+    expect(plan.minTorqueMargin).toBe(0);
+    expect(plan.totalCostText).toBe('0');
+  });
+
+  it('大力矩吞并单位力矩：所有次序均精确越界时须判不可行并给出诊断', () => {
+    // 与上一场景同构的边界判定对照：A 只能挂力臂 1e16 的导轨、B 只能挂
+    // 力臂 1 的导轨，力矩区间 [0, 1e16]。无论谁先挂，第二步的精确累计
+    // 力矩都是 10000000000000001 > 1e16（双精度下被舍入为 1e16 而看似
+    // 可行），必须判定不可行：最早无法继续挂装的是第 2 步。
+    const outcome = adjudicate({
+      rails: rails(['P', 1e16], ['p', 1]),
+      blocks: [block('A', 1, [[0, 0]]), block('B', 1, [[1, 0]])],
+      limits: limits(2, 0, 1e16),
+    });
+    expect(outcome.feasible).toBe(false);
+    if (outcome.feasible) return;
+    // 最深可行前缀长度 1：B@p（余量 1）优于 A@P（余量 0），按裁决优先级取 B
+    expect(outcome.report.witnessPrefix).toHaveLength(1);
+    expect(outcome.report.witnessPrefix[0].blockIndex).toBe(1);
+    expect(outcome.report.witnessPrefix[0].cumulativeTorque).toBe(1);
+    // 从该前缀出发，剩余 A@P 触发力矩上限（精确累计 10000000000000001 > 1e16）
+    expect(outcome.report.violations).toHaveLength(1);
+    expect(outcome.report.violations[0].blockIndex).toBe(0);
+    expect(outcome.report.violations[0].kinds).toEqual(['torque-high']);
+  });
+
   it('联合确定位置与次序：不得先选最终位置再事后排序', () => {
     // b4 挂 L（-6）时最终合力矩可为 0，但任何挂装次序都会在中途越界；
     // 只有 b4 挂 H（-3）且 b3 挂 L 并交错挂装才全程安全，且代价更高（9）。

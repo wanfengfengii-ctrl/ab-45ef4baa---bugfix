@@ -5,7 +5,14 @@
  * 0.1 + 0.2 与 0.3 在十进制下相等，必须判为同成本；而 1e-10 与 0 这类
  * 极小但真实的十进制差额又必须保持严格有序。二进制浮点累加两者都做不到
  * （0.1+0.2 === 0.30000000000000004），因此代价的求和与比较全部在此
- * 十进制表示上完成，物理量（质量、力矩）不在此列，仍走浮点 + EPS。
+ * 十进制表示上完成。
+ *
+ * 载荷与力矩的**累计与边界判定**同样在此十进制表示上完成：双精度在某量级
+ * 附近会吞掉小于 ULP 的增量（如 1e16 + 1 === 1e16，ULP 为 2），若按浮点
+ * 累计，精确累计力矩 10000000000000001 会被舍入为 1e16 而误判未越界。
+ * 质量、力臂、区间端点均按各自的最短往返十进制表示恢复为精确值（与录入
+ * 文本一致），累计与比较全程不经过双精度舍入；仅展示与力矩余量决胜用的
+ * 数值视图才转回双精度。
  */
 export interface Decimal {
   readonly coefficient: bigint;
@@ -94,6 +101,14 @@ export function decimalAdd(a: Decimal, b: Decimal): Decimal {
     a.coefficient * 10n ** BigInt(a.exponent - exponent) +
     b.coefficient * 10n ** BigInt(b.exponent - exponent);
   return normalize({ coefficient, exponent });
+}
+
+/** 精确乘法（如 质量 × 力臂 的力矩增量）：指数相加、系数相乘。 */
+export function decimalMultiply(a: Decimal, b: Decimal): Decimal {
+  return normalize({
+    coefficient: a.coefficient * b.coefficient,
+    exponent: a.exponent + b.exponent,
+  });
 }
 
 /** 精确比较：a < b 返回 -1，a === b 返回 0，a > b 返回 1。 */

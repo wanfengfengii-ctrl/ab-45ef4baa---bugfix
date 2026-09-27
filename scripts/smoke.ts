@@ -301,6 +301,88 @@ if (r9.feasible) {
   check(p.finalMass === 4 && p.minTorqueMargin === 1, '大额代价：可行性与力矩余量不受影响');
 }
 
+// 大力矩与单位力矩混合场景：8 条导轨（两条力臂 1e16、两条 1、两条 -1e16、
+// 两条 0），4 块质量均为 1 的配重各只能挂入对应力臂的一对导轨，代价均为 0；
+// 载荷上限 4，力矩闭区间 [0, 1e16]。双精度在 1e16 附近 ULP 为 2
+// （1e16 + 1 === 1e16），A→B→C→D 第二步的精确累计力矩 10000000000000001
+// 会被舍入掩盖而误判未越界；必须拒绝该次序，返回仍可行且字典序最小的
+// 安全次序 A→C→B→D（0,2,1,3），各步累计力矩依次为 1e16、0、1、1。
+const mixedMagnitudeScenario: Scenario = {
+  rails: [
+    { id: 'P1', name: 'P1', coordinate: 1e16 },
+    { id: 'P2', name: 'P2', coordinate: 1e16 },
+    { id: 'p1', name: 'p1', coordinate: 1 },
+    { id: 'p2', name: 'p2', coordinate: 1 },
+    { id: 'N1', name: 'N1', coordinate: -1e16 },
+    { id: 'N2', name: 'N2', coordinate: -1e16 },
+    { id: 'Z1', name: 'Z1', coordinate: 0 },
+    { id: 'Z2', name: 'Z2', coordinate: 0 },
+  ],
+  blocks: [
+    { id: 'A', name: 'A', mass: 1, options: [{ railId: 'P1', cost: 0 }, { railId: 'P2', cost: 0 }] },
+    { id: 'B', name: 'B', mass: 1, options: [{ railId: 'p1', cost: 0 }, { railId: 'p2', cost: 0 }] },
+    { id: 'C', name: 'C', mass: 1, options: [{ railId: 'N1', cost: 0 }, { railId: 'N2', cost: 0 }] },
+    { id: 'D', name: 'D', mass: 1, options: [{ railId: 'Z1', cost: 0 }, { railId: 'Z2', cost: 0 }] },
+  ],
+  limits: { maxLoad: 4, minTorque: 0, maxTorque: 1e16 },
+};
+
+const r10 = adjudicate(mixedMagnitudeScenario);
+check(1e16 + 1 === 1e16, '大力矩混合：双精度确实吞掉单位力矩增量（1e16 + 1 === 1e16）');
+check(r10.feasible, '裁决模块：大力矩混合场景应判定为可行');
+if (r10.feasible) {
+  const p = r10.plan;
+  check(p.steps.length === 4, '大力矩混合：完整方案应覆盖四块配重（每块恰用一次）');
+  check(
+    p.steps.map((s) => s.blockIndex).join(',') === '0,2,1,3',
+    `大力矩混合：须拒绝 A→B→C→D，返回字典序最小安全次序 A→C→B→D（0,2,1,3；实际 ${p.steps.map((s) => s.blockIndex).join(',')}）`,
+  );
+  check(
+    p.steps.map((s) => s.optionIndex).join(',') === '0,0,0,0',
+    `大力矩混合：余量与代价并列时应按录入序号稳定决胜取 0,0,0,0（实际 ${p.steps.map((s) => s.optionIndex).join(',')}）`,
+  );
+  check(
+    p.steps.map((s) => s.cumulativeTorque).join(',') === '10000000000000000,0,1,1',
+    `大力矩混合：各步累计力矩应为 1e16、0、1、1（实际 ${p.steps.map((s) => s.cumulativeTorque).join(',')}）`,
+  );
+  check(
+    p.steps.every((s) => s.cumulativeTorque >= 0 && s.cumulativeTorque <= 1e16 && s.cumulativeMass <= 4),
+    '大力矩混合：每个前缀状态均满足载荷与力矩闭区间限制',
+  );
+  check(p.totalCostText === '0', `大力矩混合：总代价应为 0（实际 ${p.totalCostText}）`);
+  check(p.finalMass === 4 && p.finalTorque === 1, '大力矩混合：最终载荷 4、最终力矩 1');
+}
+
+// 大力矩混合的不可行对照：A 只能挂力臂 1e16、B 只能挂力臂 1，区间 [0, 1e16]；
+// 任一次序第二步的精确累计力矩都是 10000000000000001 > 1e16，须判不可行，
+// 最深前缀取余量更大的 B@p，剩余 A@P 触发力矩上限。
+const mixedInfeasibleScenario: Scenario = {
+  rails: [
+    { id: 'P', name: 'P', coordinate: 1e16 },
+    { id: 'p', name: 'p', coordinate: 1 },
+  ],
+  blocks: [
+    { id: 'A', name: 'A', mass: 1, options: [{ railId: 'P', cost: 0 }] },
+    { id: 'B', name: 'B', mass: 1, options: [{ railId: 'p', cost: 0 }] },
+  ],
+  limits: { maxLoad: 2, minTorque: 0, maxTorque: 1e16 },
+};
+
+const r11 = adjudicate(mixedInfeasibleScenario);
+check(!r11.feasible, '裁决模块：大力矩吞并单位力矩场景应判定为不可行');
+if (!r11.feasible) {
+  check(
+    r11.report.witnessPrefix.length === 1 && r11.report.witnessPrefix[0]?.blockIndex === 1,
+    '大力矩不可行：最深可行前缀应为 B@p（长度 1，最早第 2 步无法继续）',
+  );
+  check(
+    r11.report.violations.length === 1 &&
+      r11.report.violations[0].blockIndex === 0 &&
+      r11.report.violations[0].kinds.includes('torque-high'),
+    '大力矩不可行：应列出 A@P 触发力矩上限（精确累计 10000000000000001 > 1e16）',
+  );
+}
+
 // 不可行场景：深度 1 即止步，最深前缀为 b1@R（余量最大），剩余选择同时触发载荷与力矩限制。
 const infeasibleScenario: Scenario = {
   rails: [{ id: 'R', name: 'R', coordinate: 1 }],
